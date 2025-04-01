@@ -2,17 +2,19 @@
 import os
 import sys
 import subprocess
-import datetime
+import platform
+import importlib
+import time
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-import torch
-import torchaudio
+import datetime
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QUrl, QSettings
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QWidget,
     QLabel, QTextEdit, QPushButton, QFileDialog,
-    QMessageBox, QHBoxLayout, QComboBox, QLineEdit
+    QMessageBox, QHBoxLayout, QComboBox, QLineEdit,
+    QProgressDialog
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QProcess, QSettings
 from PyQt5.QtGui import QDesktopServices, QFont
 
 # --- Configuration ---
@@ -22,6 +24,165 @@ DEFAULT_CONFIG = {
     "ffmpeg_path": "ffmpeg",
     "timeout_seconds": 30
 }
+
+class DependencyInstaller:
+    """Handles all dependency installations automatically"""
+
+    SYSTEM_DEPS = {
+        "ubuntu": ["espeak-ng", "ffmpeg"],
+        "debian": ["espeak-ng", "ffmpeg"],
+        "arch": ["espeak", "ffmpeg"],
+        "fedora": ["espeak-ng", "ffmpeg"],
+        "centos": ["espeak-ng", "ffmpeg"],
+        "Darwin": ["espeak-ng", "ffmpeg"]  # macOS
+    }
+
+    PYTHON_DEPS = [
+        "torch", "torchaudio", "PyQt5",
+        "numpy", "tqdm", "requests", "distro"
+    ]
+
+    @classmethod
+    def check_and_install(cls):
+        """Check and install all required dependencies"""
+        print("\n=== Checking Dependencies ===")
+        print("Checking system dependencies...")
+        if not cls.install_system_deps():
+            print("\nPlease install system packages manually and restart")
+            time.sleep(2)
+
+        print("\nChecking Python dependencies...")
+        if not cls.install_python_deps():
+            print("\nPlease install Python packages manually and restart")
+            time.sleep(2)
+
+        print("\n=== Dependency Check Complete ===\n")
+
+    @classmethod
+    def get_package_manager(cls):
+        """Determine the appropriate package manager"""
+        system = platform.system()
+
+        if system == "Darwin":
+            return "brew"
+
+        try:
+            import distro
+            distro_id = distro.id().lower()
+        except:
+            distro_id = None
+
+        if distro_id in ["ubuntu", "debian", "pop"]:
+            return "apt"
+        elif distro_id in ["arch", "manjaro"]:
+            return "pacman"
+        elif distro_id in ["fedora", "centos", "rhel"]:
+            return "dnf"
+        return None
+
+    @classmethod
+    def install_system_deps(cls):
+        """Install system-level dependencies"""
+        pkg_manager = cls.get_package_manager()
+        system = platform.system()
+
+        if not pkg_manager:
+            print("⚠️ Unsupported OS/distro. Please install these manually:")
+            print(", ".join(cls.SYSTEM_DEPS.get("ubuntu", [])))
+            return False
+
+        if system == "Darwin":
+            packages = cls.SYSTEM_DEPS["Darwin"]
+        else:
+            try:
+                import distro
+                distro_id = distro.id().lower()
+                packages = cls.SYSTEM_DEPS.get(distro_id, cls.SYSTEM_DEPS["ubuntu"])
+            except:
+                packages = cls.SYSTEM_DEPS["ubuntu"]
+
+        print(f"Required system packages: {', '.join(packages)}")
+
+        try:
+            if pkg_manager == "apt":
+                print("Updating package lists...")
+                subprocess.run(["sudo", "apt-get", "update"], check=True)
+                cmd = ["sudo", "apt-get", "install", "-y"] + packages
+            elif pkg_manager == "pacman":
+                cmd = ["sudo", "pacman", "-S", "--noconfirm"] + packages
+            elif pkg_manager == "dnf":
+                cmd = ["sudo", "dnf", "install", "-y"] + packages
+            elif pkg_manager == "brew":
+                cmd = ["brew", "install"] + packages
+
+            print(f"Running: {' '.join(cmd)}")
+            result = subprocess.run(cmd)
+            if result.returncode == 0:
+                print("✅ System dependencies installed successfully")
+                return True
+            else:
+                print("⚠️ Package manager returned error code")
+                return False
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Failed to install system dependencies: {e}")
+            print(f"Please install these packages manually: {', '.join(packages)}")
+            return False
+        except Exception as e:
+            print(f"❌ Unexpected error: {str(e)}")
+            return False
+
+    @classmethod
+    def install_python_deps(cls):
+        """Install Python packages using pip"""
+        missing = []
+        for package in cls.PYTHON_DEPS:
+            try:
+                importlib.import_module(package)
+            except ImportError:
+                missing.append(package)
+
+        if not missing:
+            print("✅ All Python dependencies already installed")
+            return True
+
+        print(f"Missing Python packages: {', '.join(missing)}")
+
+        # First ensure pip is up to date
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], check=True)
+        except:
+            pass
+
+        try:
+            # Try pip with --user first
+            print("Attempting installation with pip...")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--user"] + missing,
+                check=True
+            )
+            print("✅ Python dependencies installed successfully")
+            return True
+        except subprocess.CalledProcessError:
+            try:
+                # Fallback to uv if available
+                print("Attempting installation with uv...")
+                subprocess.run(
+                    [sys.executable, "-m", "uv", "pip", "install"] + missing,
+                    check=True
+                )
+                print("✅ Python dependencies installed successfully (using uv)")
+                return True
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                print("❌ Failed to install Python dependencies")
+                print("Please install them manually with:")
+                print(f"pip install {' '.join(missing)}")
+                return False
+
+def force_cpu():
+    """Ensure CPU-only operation"""
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ.pop("DRI_PRIME", None)
+    torch.set_num_threads(1)
 
 class MediaHandler:
     @staticmethod
@@ -54,12 +215,6 @@ class MediaHandler:
                     raise RuntimeError("FFmpeg timeout - file may be corrupt")
                 except Exception as e:
                     raise RuntimeError(f"FFmpeg failed: {str(e)}")
-
-def force_cpu():
-    """Ensure CPU-only operation"""
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    os.environ.pop("DRI_PRIME", None)
-    torch.set_num_threads(1)
 
 def scan_preset_voices(presets_dir):
     """Scan presets directory for available voices"""
@@ -241,34 +396,13 @@ class VoiceCloneGUI(QMainWindow):
         self.custom_voice_layout.setEnabled(False)
         layout.addLayout(self.custom_voice_layout)
 
-    def play_voice_preview(self):
-        """Play the original voice file for preview"""
-        voice_name = self.voice_combo.currentText()
-        if voice_name == "Custom Voice":
-            if self.current_voice_file:
-                self.play_audio_file(self.current_voice_file)
-            else:
-                QMessageBox.warning(self, "Error", "No custom voice file selected")
-            return
-
-        voice_file = self.available_voices.get(voice_name)
-        if not voice_file:
-            QMessageBox.warning(self, "Error", "No voice file found for selected preset")
-            return
-
-        if not Path(voice_file).exists():
-            QMessageBox.warning(self, "Error", f"Voice file not found:\n{voice_file}")
-            return
-
-        self.play_audio_file(voice_file)
-
-    def play_audio_file(self, file_path):
-        """Play audio file using default system player"""
-        try:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(file_path)))
-            self.status_bar.setText(f"Playing: {Path(file_path).name}")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Couldn't play file:\n{str(e)}")
+    def refresh_voice_list(self):
+        """Refresh the list of available voices"""
+        self.voice_combo.clear()
+        self.available_voices = scan_preset_voices(self.config["presets_dir"])
+        self.voice_combo.addItems(self.available_voices.keys())
+        if "Custom Voice" not in self.available_voices:
+            self.voice_combo.addItem("Custom Voice")
 
     def browse_directory(self, dir_type):
         """Browse for a directory"""
@@ -293,38 +427,6 @@ class VoiceCloneGUI(QMainWindow):
         self.save_config(self.config)
         self.refresh_voice_list()
         QMessageBox.information(self, "Success", "Folder settings saved and updated")
-
-    def refresh_voice_list(self):
-        """Refresh the list of available voices"""
-        self.voice_combo.clear()
-        self.available_voices = scan_preset_voices(self.config["presets_dir"])
-        self.voice_combo.addItems(self.available_voices.keys())
-        if "Custom Voice" not in self.available_voices:
-            self.voice_combo.addItem("Custom Voice")
-
-    def open_output_file(self, event):
-        """Open the last output file"""
-        if self.last_output and Path(self.last_output).exists():
-            try:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_output))
-            except Exception as e:
-                QMessageBox.warning(self, "Error", f"Couldn't open file:\n{str(e)}")
-        else:
-            QMessageBox.warning(self, "Error", f"Output file not found:\n{self.last_output}")
-
-    def load_model(self):
-        """Load the Zonos model"""
-        try:
-            force_cpu()
-            from zonos.model import Zonos
-            self.status_bar.setText("Loading model...")
-            QApplication.processEvents()
-
-            self.model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device="cpu")
-            self.status_bar.setText("Model loaded successfully")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load model: {str(e)}")
-            self.status_bar.setText("Model loading failed")
 
     def handle_voice_change(self, voice_name):
         """Handle voice selection changes"""
@@ -359,6 +461,59 @@ class VoiceCloneGUI(QMainWindow):
             if file_path not in self.available_voices.values():
                 self.refresh_voice_list()
             self.play_btn.setEnabled(True)
+
+    def play_voice_preview(self):
+        """Play the original voice file for preview"""
+        voice_name = self.voice_combo.currentText()
+        if voice_name == "Custom Voice":
+            if self.current_voice_file:
+                self.play_audio_file(self.current_voice_file)
+            else:
+                QMessageBox.warning(self, "Error", "No custom voice file selected")
+            return
+
+        voice_file = self.available_voices.get(voice_name)
+        if not voice_file:
+            QMessageBox.warning(self, "Error", "No voice file found for selected preset")
+            return
+
+        if not Path(voice_file).exists():
+            QMessageBox.warning(self, "Error", f"Voice file not found:\n{voice_file}")
+            return
+
+        self.play_audio_file(voice_file)
+
+    def play_audio_file(self, file_path):
+        """Play audio file using default system player"""
+        try:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(file_path)))
+            self.status_bar.setText(f"Playing: {Path(file_path).name}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Couldn't play file:\n{str(e)}")
+
+    def open_output_file(self, event):
+        """Open the last output file"""
+        if self.last_output and Path(self.last_output).exists():
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_output))
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Couldn't open file:\n{str(e)}")
+        else:
+            QMessageBox.warning(self, "Error", f"Output file not found:\n{self.last_output}")
+
+    def load_model(self):
+        """Load the Zonos model"""
+        try:
+            force_cpu()
+            from zonos.model import Zonos
+            self.status_bar.setText("Loading model...")
+            QApplication.processEvents()
+
+            self.model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device="cpu")
+            self.status_bar.setText("Model loaded successfully")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load model: {str(e)}")
+            self.status_bar.setText("Model loading failed")
 
     def generate_speech(self):
         """Generate cloned voice output"""
@@ -416,6 +571,14 @@ class VoiceCloneGUI(QMainWindow):
         QMessageBox.critical(self, "Error", f"Generation failed:\n{error_msg}")
 
 def main():
+    # First install dependencies if needed
+    DependencyInstaller.check_and_install()
+
+    # Now import torch after potential installation
+    global torch, torchaudio
+    import torch
+    import torchaudio
+
     # Suppress warnings
     os.environ["QT_LOGGING_RULES"] = "*.warning=false"
     os.environ["QT_QPA_PLATFORM"] = "xcb"
