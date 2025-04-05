@@ -1,443 +1,274 @@
 #!/usr/bin/env python3
-import os
-import sys
-import subprocess
+import os, sys, traceback
 from pathlib import Path
 import datetime
 
-# ----------------------------
-# Virtual Environment Handling
-# ----------------------------
-def in_virtualenv():
-    # Check if we are running in a virtual environment.
-    return (
-        hasattr(sys, 'real_prefix') or
-        (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)
-    )
+EXPECTED_VENV_DIR = Path.cwd() / ".venv"
 
-def ensure_virtualenv():
-    if not in_virtualenv():
-        print("Not running in a virtual environment. Creating one...")
-        venv_dir = Path("venv")
-        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
-        # Re-run the script using the venv python.
-        if os.name == "nt":
-            venv_python = str(venv_dir / "Scripts" / "python.exe")
-        else:
-            venv_python = str(venv_dir / "bin" / "python")
-        print(f"Restarting with virtual environment interpreter: {venv_python}")
-        os.execv(venv_python, [venv_python] + sys.argv)
-
-# Ensure we are running in a virtual environment.
-ensure_virtualenv()
-
-# ----------------------------
-# UV-Based Environment Setup
-# ----------------------------
-def is_uv_installed():
-    try:
-        subprocess.run(["uv", "--version"], check=True, stdout=subprocess.DEVNULL)
-        return True
-    except Exception:
-        return False
-
-def install_uv():
-    print("Installing uv...")
-    subprocess.run("curl -LsSf https://astral.sh/uv/install.sh | sh", shell=True, check=True)
-
-def run_uv_sync():
-    """
-    Run the uv commands as per the Zonos README:
-      uv sync
-      uv sync --extra compile
-      uv pip install -e .[compile]
-    These commands are run only once; we mark completion with an environment variable.
-    """
-    print("Running uv sync routines...")
-    subprocess.run(["uv", "sync"], check=True)
-    subprocess.run(["uv", "sync", "--extra", "compile"], check=True)
-    subprocess.run(["uv", "pip", "install", "-e", ".[compile]"], check=True)
-    os.environ["UV_SYNC_DONE"] = "1"
-    print("uv sync complete; restarting script.")
-    print(f"Current interpreter: {sys.executable}")
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-
-# Run the uv sync routines if not already done.
-if not os.environ.get("UV_SYNC_DONE"):
-    if not is_uv_installed():
-        install_uv()
-    try:
-        run_uv_sync()
-    except Exception as e:
-        print(f"uv sync failed: {e}")
+def check_environment():
+    # Check environment activated
+    venv_path = os.getenv("VIRTUAL_ENV")
+    if not venv_path or not venv_path.startswith(str(EXPECTED_VENV_DIR)):
+        print("\n[Zonos Launcher] Error: Not in the dedicated virtual environment!")
+        print(f"Expected VENV activated in: {EXPECTED_VENV_DIR}")
+        print("Please run:\n")
+        print("  source .venv/bin/activate")
+        print("  python gui.py\n")
         sys.exit(1)
 
-# ----------------------------
-# Begin GUI Front End Code
-# ----------------------------
-# At this point, we assume the virtual environment is set up correctly.
-try:
-    import torch
-    import torchaudio
-except ModuleNotFoundError as e:
-    print(f"Error importing modules: {e}")
-    print("It appears that some dependencies are missing. Please ensure that uv has installed torch correctly.")
+check_environment()
+
+REQUIRED_PKGS = [
+    "torch", "torchaudio", "numpy", "PyQt5", "transformers",
+    "huggingface_hub", "sentencepiece", "safetensors", "gradio",
+    "langcodes", "einops", "kanjize"
+]
+
+missing = []
+for pkg in REQUIRED_PKGS:
+    try:
+        __import__(pkg)
+    except ImportError:
+        missing.append(pkg)
+
+if missing:
+    print("\n==== Missing required packages ====\n")
+    print(" ".join(missing))
+    print("\nPlease run setup again:\n")
+    print("  source .venv/bin/activate")
+    print("  ./setup_zonos.sh\n")
     sys.exit(1)
 
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QUrl, QSettings
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QVBoxLayout, QWidget,
-    QLabel, QTextEdit, QPushButton, QFileDialog,
-    QMessageBox, QHBoxLayout, QComboBox, QLineEdit
-)
-from PyQt5.QtGui import QDesktopServices, QFont
+# === Imports proceed safely ===
 
-# Default configuration – user settings are preserved using QSettings.
-DEFAULT_CONFIG = {
-    "output_dir": str(Path.home() / ".zonos_output"),
-    "presets_dir": str(Path.home() / ".zonos_presets"),
-    "ffmpeg_path": "ffmpeg",
-    "timeout_seconds": 30
-}
+try:
+    import torch, torchaudio
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QSettings
+    from PyQt5.QtWidgets import *
+    from PyQt5.QtGui import QFont, QDesktopServices
+except Exception as e:
+    print("\nUnexpected import error:", e)
+    sys.exit(1)
 
+# Optionally force CPU use only, safer on many systems
 def force_cpu():
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ.pop("DRI_PRIME", None)
     torch.set_num_threads(1)
 
-class MediaHandler:
-    @staticmethod
-    def load_audio(file_path, sample_rate=24000, timeout=30):
-        try:
-            wav, sr = torchaudio.load(file_path)
-            if sr != sample_rate:
-                wav = torchaudio.functional.resample(wav, sr, sample_rate)
-            return wav
-        except Exception as e:
-            print(f"Torchaudio failed, using FFmpeg fallback: {str(e)}")
-            from tempfile import NamedTemporaryFile
-            with NamedTemporaryFile(suffix=".wav") as tmpfile:
-                cmd = [
-                    "ffmpeg",
-                    "-y", "-i", str(file_path),
-                    "-ac", "1", "-ar", str(sample_rate),
-                    "-vn", "-f", "wav", tmpfile.name
-                ]
-                subprocess.run(cmd, timeout=timeout, check=True,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                return torchaudio.load(tmpfile.name)[0]
+DEFAULT_CONFIG = {
+    'output_dir': str(Path.home() / '.zonos_output'),
+    'presets_dir': str(Path.home() / '.zonos_presets')
+}
 
-def scan_preset_voices(presets_dir):
-    voices = {"Custom Voice": None}
-    presets_path = Path(presets_dir)
-    presets_path.mkdir(parents=True, exist_ok=True)
-    for ext in ["*.wav", "*.mp3", "*.ogg", "*.flac", "*.mp4", "*.mov", "*.mkv", "*.webm"]:
-        for file in presets_path.glob(ext):
-            voices[file.stem] = str(file.absolute())
-    return voices
+def scan_presets(pdir):
+    presets = {'Custom Voice': None}
+    Path(pdir).mkdir(parents=True, exist_ok=True)
+    for ext in ['*.wav','*.mp3','*.ogg','*.flac','*.mp4','*.mov','*.mkv','*.webm']:
+        for f in Path(pdir).glob(ext):
+            presets[f.stem] = str(f.resolve())
+    return presets
 
-class GenerationThread(QThread):
-    finished = pyqtSignal(str)
+class Worker(QThread):
+    done = pyqtSignal(str)
     error = pyqtSignal(str)
-    def __init__(self, model, audio_path, text, output_dir, config):
+
+    def __init__(self, model, voice_path, text, outdir):
         super().__init__()
         self.model = model
-        self.audio_path = audio_path
+        self.voice_path = voice_path
         self.text = text
-        self.output_dir = output_dir
-        self.config = config
+        self.outdir = outdir
+
     def run(self):
         try:
             from zonos.conditioning import make_cond_dict
-            wav = MediaHandler.load_audio(
-                self.audio_path,
-                sample_rate=24000,
-                timeout=self.config["timeout_seconds"]
-            )
-            speaker = self.model.make_speaker_embedding(wav, 24000)
-            cond_dict = make_cond_dict(text=self.text, speaker=speaker, language="en-us")
-            codes = self.model.generate(self.model.prepare_conditioning(cond_dict))
+            wav, sr = torchaudio.load(self.voice_path)
+            speaker = self.model.make_speaker_embedding(wav, sr)
+            cond = make_cond_dict(text=self.text, speaker=speaker, language='en-us')
+            prep = self.model.prepare_conditioning(cond)
+            codes = self.model.generate(prep)
             wavs = self.model.autoencoder.decode(codes).cpu()
-            output_dir = Path(self.config["output_dir"])
-            output_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = output_dir / f"output_{timestamp}.wav"
-            torchaudio.save(output_file, wavs[0], self.model.autoencoder.sampling_rate)
-            self.finished.emit(str(output_file.absolute()))
-        except Exception as e:
-            self.error.emit(str(e))
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = Path(self.outdir)/f"zonos_{ts}.wav"
+            Path(self.outdir).mkdir(parents=True, exist_ok=True)
+            torchaudio.save(out_path, wavs[0], self.model.autoencoder.sampling_rate)
+            self.done.emit(str(out_path.resolve()))
+        except Exception:
+            self.error.emit(traceback.format_exc())
 
-class VoiceCloneGUI(QMainWindow):
-    def __init__(self, config, save_config_callback):
+class VoiceCloner(QMainWindow):
+    def __init__(self):
         super().__init__()
-        self.config = config
-        self.save_config = save_config_callback
         self.setWindowTitle("Zonos Voice Cloner")
-        self.setGeometry(100, 100, 700, 600)
-        font = QFont()
-        font.setStyleHint(QFont.SansSerif)
-        font.setPointSize(10)
-        self.setFont(font)
-        self.model = None
-        self.current_voice_file = None
+        font = QFont(); font.setPointSize(9); self.setFont(font)
+
+        self.settings = QSettings("Zonos", "VoiceCloner")
+        self.config = dict(DEFAULT_CONFIG)
+        for k in self.config:
+            v = self.settings.value(k)
+            if v: self.config[k] = v
+
         self.last_output = None
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        layout = QVBoxLayout()
-        main_widget.setLayout(layout)
-        self.setup_directory_ui(layout)
-        self.setup_voice_ui(layout)
-        layout.addWidget(QLabel("Text to Clone:"))
-        self.text_input = QTextEdit()
-        self.text_input.setPlaceholderText("Enter text to convert to speech...")
-        layout.addWidget(self.text_input)
-        self.generate_btn = QPushButton("Generate Cloned Voice")
-        self.generate_btn.clicked.connect(self.generate_speech)
-        self.generate_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-        layout.addWidget(self.generate_btn)
-        layout.addWidget(QLabel("Latest Output:"))
-        self.output_link = QLabel("No output generated yet")
-        self.output_link.setStyleSheet("color: #0066cc; text-decoration: underline;")
-        self.output_link.setCursor(Qt.PointingHandCursor)
-        self.output_link.mousePressEvent = self.open_output_file
-        layout.addWidget(self.output_link)
-        self.status_bar = QLabel("Ready")
-        self.status_bar.setAlignment(Qt.AlignCenter)
-        self.status_bar.setStyleSheet("color: #666; font-style: italic;")
-        layout.addWidget(self.status_bar)
+
+        cw = QWidget(); self.setCentralWidget(cw)
+        lay = QVBoxLayout(cw)
+
+        fr = QHBoxLayout()
+        fr.addWidget(QLabel("Presets folder:"))
+        self.presets_edit = QLineEdit(self.config['presets_dir']); fr.addWidget(self.presets_edit)
+        pb = QPushButton("Browse"); pb.clicked.connect(self.set_presets_dir); fr.addWidget(pb)
+        fo = QPushButton("Open"); fo.clicked.connect(lambda:self.open_dir(self.presets_edit.text())); fr.addWidget(fo)
+        lay.addLayout(fr)
+
+        ofr = QHBoxLayout()
+        ofr.addWidget(QLabel("Output folder:"))
+        self.out_edit = QLineEdit(self.config['output_dir']); ofr.addWidget(self.out_edit)
+        pb2 = QPushButton("Browse"); pb2.clicked.connect(self.set_output_dir); ofr.addWidget(pb2)
+        fo2 = QPushButton("Open"); fo2.clicked.connect(lambda:self.open_dir(self.out_edit.text())); ofr.addWidget(fo2)
+        lay.addLayout(ofr)
+
+        savebtn = QPushButton("Save folders"); savebtn.clicked.connect(self.save_paths)
+        lay.addWidget(savebtn)
+
+        hr = QHBoxLayout()
+        hr.addWidget(QLabel("Voice Preset:"))
+        self.combo = QComboBox(); hr.addWidget(self.combo)
+        self.combo.currentTextChanged.connect(self.voice_change)
+        self.playbtn = QPushButton("Play"); hr.addWidget(self.playbtn)
+        self.playbtn.clicked.connect(self.play_voice)
+        lay.addLayout(hr)
+
+        self.custom_container = QWidget()
+        ch = QHBoxLayout(self.custom_container)
+        ch.addWidget(QLabel("Custom file:"))
+        self.cust_label = QLabel("None"); ch.addWidget(self.cust_label)
+        bc = QPushButton("Browse..."); ch.addWidget(bc)
+        bc.clicked.connect(self.pick_custom)
+        lay.addWidget(self.custom_container)
+        self.custom_container.setVisible(False)
+
+        lay.addWidget(QLabel("Text:"))
+        self.textbox = QTextEdit(); lay.addWidget(self.textbox)
+
+        self.genbtn = QPushButton("Generate voice"); lay.addWidget(self.genbtn)
+        self.genbtn.clicked.connect(self.generate)
+
+        self.status = QLabel("Ready"); lay.addWidget(self.status)
+        self.outlabel = QLabel("No output yet."); lay.addWidget(self.outlabel)
+
+        self.refresh_presets()
+        self.model = None
+        self.voice_path = None
+
         self.load_model()
-    def setup_directory_ui(self, layout):
-        layout.addWidget(QLabel("Folder Settings:"))
-        presets_layout = QHBoxLayout()
-        presets_layout.addWidget(QLabel("Presets Directory:"))
-        self.presets_dir_input = QLineEdit(self.config["presets_dir"])
-        presets_layout.addWidget(self.presets_dir_input)
-        self.presets_browse_btn = QPushButton("Browse...")
-        self.presets_browse_btn.clicked.connect(lambda: self.browse_directory("presets_dir"))
-        presets_layout.addWidget(self.presets_browse_btn)
-        self.presets_open_btn = QPushButton("Open")
-        self.presets_open_btn.clicked.connect(lambda: self.open_directory(self.config["presets_dir"]))
-        presets_layout.addWidget(self.presets_open_btn)
-        layout.addLayout(presets_layout)
-        output_layout = QHBoxLayout()
-        output_layout.addWidget(QLabel("Output Directory:"))
-        self.output_dir_input = QLineEdit(self.config["output_dir"])
-        output_layout.addWidget(self.output_dir_input)
-        self.output_browse_btn = QPushButton("Browse...")
-        self.output_browse_btn.clicked.connect(lambda: self.browse_directory("output_dir"))
-        output_layout.addWidget(self.output_browse_btn)
-        self.output_open_btn = QPushButton("Open")
-        self.output_open_btn.clicked.connect(lambda: self.open_directory(self.config["output_dir"]))
-        output_layout.addWidget(self.output_open_btn)
-        layout.addLayout(output_layout)
-        self.save_btn = QPushButton("Save Folder Settings")
-        self.save_btn.clicked.connect(self.save_folder_settings)
-        layout.addWidget(self.save_btn)
-    def setup_voice_ui(self, layout):
-        voice_layout = QHBoxLayout()
-        voice_layout.addWidget(QLabel("Select Voice:"))
-        self.voice_combo = QComboBox()
-        self.refresh_voice_list()
-        self.voice_combo.currentTextChanged.connect(self.handle_voice_change)
-        voice_layout.addWidget(self.voice_combo)
-        self.play_btn = QPushButton("Play Original")
-        self.play_btn.clicked.connect(self.play_voice_preview)
-        self.play_btn.setToolTip("Play the original voice file")
-        voice_layout.addWidget(self.play_btn)
-        layout.addLayout(voice_layout)
-        self.custom_voice_layout = QHBoxLayout()
-        self.custom_voice_layout.addWidget(QLabel("Custom Voice File:"))
-        self.voice_path_label = QLabel("No file selected")
-        self.voice_path_label.setStyleSheet("color: #666; font-style: italic;")
-        self.custom_voice_layout.addWidget(self.voice_path_label)
-        self.custom_voice_layout.addStretch()
-        self.browse_voice_btn = QPushButton("Browse...")
-        self.browse_voice_btn.clicked.connect(self.select_voice_file)
-        self.browse_voice_btn.setToolTip("Supports: Audio (MP3/WAV/OGG/FLAC) or Video (MP4/MOV/MKV) files")
-        self.custom_voice_layout.addWidget(self.browse_voice_btn)
-        self.custom_voice_layout.setEnabled(False)
-        layout.addLayout(self.custom_voice_layout)
-    def refresh_voice_list(self):
-        self.voice_combo.clear()
-        def scan_preset_voices(presets_dir):
-            voices = {"Custom Voice": None}
-            presets_path = Path(presets_dir)
-            presets_path.mkdir(parents=True, exist_ok=True)
-            for ext in ["*.wav", "*.mp3", "*.ogg", "*.flac", "*.mp4", "*.mov", "*.mkv", "*.webm"]:
-                for file in presets_path.glob(ext):
-                    voices[file.stem] = str(file.absolute())
-            return voices
-        self.available_voices = scan_preset_voices(self.config["presets_dir"])
-        self.voice_combo.addItems(self.available_voices.keys())
-        if "Custom Voice" not in self.available_voices:
-            self.voice_combo.addItem("Custom Voice")
-    def browse_directory(self, dir_type):
-        from PyQt5.QtWidgets import QFileDialog
-        dir_path = QFileDialog.getExistingDirectory(self, f"Select {dir_type.replace('_', ' ').title()}")
-        if dir_path:
-            if dir_type == "presets_dir":
-                self.presets_dir_input.setText(dir_path)
-            else:
-                self.output_dir_input.setText(dir_path)
-    def open_directory(self, path):
-        from PyQt5.QtGui import QDesktopServices
-        from PyQt5.QtCore import QUrl
-        if Path(path).exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-        else:
-            QMessageBox.warning(self, "Error", f"Directory not found:\n{path}")
-    def save_folder_settings(self):
-        from PyQt5.QtCore import QSettings
-        settings = QSettings("Zonos", "VoiceCloner")
-        self.config["presets_dir"] = self.presets_dir_input.text()
-        self.config["output_dir"] = self.output_dir_input.text()
-        for key, value in self.config.items():
-            settings.setValue(key, value)
-        self.refresh_voice_list()
-        QMessageBox.information(self, "Success", "Folder settings saved and updated")
-    def handle_voice_change(self, voice_name):
-        if voice_name == "Custom Voice":
-            self.custom_voice_layout.setEnabled(True)
-            self.current_voice_file = None
-            self.voice_path_label.setText("No file selected")
-            self.play_btn.setEnabled(False)
-        else:
-            self.custom_voice_layout.setEnabled(False)
-            voice_file = self.available_voices.get(voice_name)
-            if voice_file and Path(voice_file).exists():
-                self.current_voice_file = Path(voice_file)
-                self.voice_path_label.setText(str(self.current_voice_file))
-                self.play_btn.setEnabled(True)
-            else:
-                self.current_voice_file = None
-                self.voice_path_label.setText("Preset file not found")
-                self.play_btn.setEnabled(False)
-    def select_voice_file(self):
-        from PyQt5.QtWidgets import QFileDialog
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Voice File",
-            "",
-            "Media Files (*.wav *.mp3 *.ogg *.flac *.mp4 *.mov *.mkv);;All Files (*)"
-        )
-        if file_path:
-            self.current_voice_file = Path(file_path)
-            self.voice_path_label.setText(file_path)
-            if file_path not in self.available_voices.values():
-                self.refresh_voice_list()
-            self.play_btn.setEnabled(True)
-    def play_voice_preview(self):
-        from PyQt5.QtGui import QDesktopServices
-        from PyQt5.QtCore import QUrl
-        voice_name = self.voice_combo.currentText()
-        if voice_name == "Custom Voice":
-            if self.current_voice_file:
-                self.play_audio_file(self.current_voice_file)
-            else:
-                QMessageBox.warning(self, "Error", "No custom voice file selected")
+
+    def refresh_presets(self):
+        self.presets = scan_presets(self.presets_edit.text())
+        self.combo.clear()
+        self.combo.addItems(self.presets.keys())
+
+    def save_paths(self):
+        self.config['presets_dir'] = self.presets_edit.text()
+        self.config['output_dir'] = self.out_edit.text()
+        for k, v in self.config.items():
+            self.settings.setValue(k, v)
+        self.refresh_presets()
+        QMessageBox.information(self, "Saved", "Folders saved.")
+
+    def set_presets_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Presets Directory")
+        if d:
+            self.presets_edit.setText(d)
+            self.refresh_presets()
+
+    def set_output_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Output Directory")
+        if d:
+            self.out_edit.setText(d)
+
+    def open_dir(self, path):
+        p = Path(path)
+        if p.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.resolve())))
+
+    def voice_change(self, vname):
+        if vname == "Custom Voice":
+            self.custom_container.setVisible(True)
+            self.voice_path = None
+            self.cust_label.setText("None")
+            self.playbtn.setEnabled(False)
             return
-        voice_file = self.available_voices.get(voice_name)
-        if not voice_file:
-            QMessageBox.warning(self, "Error", "No voice file found for selected preset")
-            return
-        if not Path(voice_file).exists():
-            QMessageBox.warning(self, "Error", f"Voice file not found:\n{voice_file}")
-            return
-        self.play_audio_file(voice_file)
-    def play_audio_file(self, file_path):
-        from PyQt5.QtGui import QDesktopServices
-        from PyQt5.QtCore import QUrl
-        try:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(file_path)))
-            self.status_bar.setText(f"Playing: {Path(file_path).name}")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Couldn't play file:\n{str(e)}")
-    def open_output_file(self, event):
-        from PyQt5.QtGui import QDesktopServices
-        from PyQt5.QtCore import QUrl
-        if self.last_output and Path(self.last_output).exists():
-            try:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_output))
-            except Exception as e:
-                QMessageBox.warning(self, "Error", f"Couldn't open file:\n{str(e)}")
         else:
-            QMessageBox.warning(self, "Error", f"Output file not found:\n{self.last_output}")
+            self.custom_container.setVisible(False)
+            f = self.presets.get(vname)
+            if f and Path(f).exists():
+                self.voice_path = Path(f)
+                self.playbtn.setEnabled(True)
+            else:
+                self.voice_path = None
+                self.playbtn.setEnabled(False)
+
+    def pick_custom(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Select audio")
+        if f:
+            self.voice_path = Path(f)
+            self.cust_label.setText(f)
+            self.playbtn.setEnabled(True)
+
+    def play_voice(self):
+        if self.voice_path and self.voice_path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.voice_path.resolve())))
+
     def load_model(self):
         try:
             force_cpu()
             from zonos.model import Zonos
-            self.status_bar.setText("Loading model...")
+            self.status.setText("Loading model...")
             QApplication.processEvents()
-            self.model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device="cpu")
-            self.status_bar.setText("Model loaded successfully")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load model: {str(e)}")
-            self.status_bar.setText("Model loading failed")
-    def generate_speech(self):
+            self.model = Zonos.from_pretrained("Zyphra/Zonos-v0.1-transformer", device='cpu')
+            self.status.setText("Model loaded.")
+        except Exception:
+            tb = traceback.format_exc()
+            print(tb)
+            QMessageBox.critical(self, "Error loading model", tb)
+            self.status.setText("Model load error")
+
+    def generate(self):
         if not self.model:
-            QMessageBox.warning(self, "Error", "Model not loaded")
+            QMessageBox.warning(self, "No model", "Model not loaded yet")
             return
-        if not self.current_voice_file:
-            QMessageBox.warning(self, "Error", "Please select a voice file")
+        txt = self.textbox.toPlainText().strip()
+        if not txt:
+            QMessageBox.warning(self, "No input", "Please enter some text")
             return
-        text = self.text_input.toPlainText().strip()
-        if not text:
-            QMessageBox.warning(self, "Error", "Please enter some text")
+        if not self.voice_path or not self.voice_path.exists():
+            QMessageBox.warning(self, "No voice", "Please select a reference voice")
             return
-        self.set_ui_enabled(False)
-        self.status_bar.setText("Generating speech...")
-        from pathlib import Path
-        output_dir = Path(self.config["output_dir"])
-        output_dir.mkdir(parents=True, exist_ok=True)
-        self.thread = GenerationThread(
-            model=self.model,
-            audio_path=self.current_voice_file,
-            text=text,
-            output_dir=output_dir,
-            config=self.config
-        )
-        self.thread.finished.connect(self.generation_complete)
-        self.thread.error.connect(self.generation_error)
-        self.thread.start()
-    def set_ui_enabled(self, enabled):
-        self.voice_combo.setEnabled(enabled)
-        self.browse_voice_btn.setEnabled(enabled)
-        self.text_input.setEnabled(enabled)
-        self.generate_btn.setEnabled(enabled)
-        self.play_btn.setEnabled(enabled)
-    def generation_complete(self, output_file):
-        self.set_ui_enabled(True)
-        self.last_output = output_file
-        from pathlib import Path
-        short_path = str(Path(output_file).relative_to(Path.home()))
-        self.output_link.setText(f"Click to play: ~/{short_path}")
-        self.status_bar.setText(f"Output saved to: {output_file}")
-        QMessageBox.information(self, "Success", f"Output saved to:\n{output_file}")
-    def generation_error(self, error_msg):
-        self.set_ui_enabled(True)
-        self.status_bar.setText("Generation failed")
-        QMessageBox.critical(self, "Error", f"Generation failed:\n{error_msg}")
+
+        self.status.setText("Generating...")
+        QApplication.processEvents()
+        wrk = Worker(self.model, self.voice_path, txt, self.out_edit.text())
+        self.worker = wrk
+        wrk.done.connect(self.gen_done)
+        wrk.error.connect(self.gen_error)
+        wrk.start()
+
+    def gen_done(self, path):
+        self.last_output = path
+        self.status.setText("Done")
+        self.outlabel.setText(f"Saved to:\n{path}")
+        QMessageBox.information(self, "Done", f"Voice saved:\n{path}")
+
+    def gen_error(self, error_text):
+        self.status.setText("Error")
+        print(error_text)
+        QMessageBox.critical(self, "Generation failed", error_text)
 
 def main():
-    from PyQt5.QtCore import QSettings
     app = QApplication(sys.argv)
-    font = QFont()
-    font.setStyleHint(QFont.SansSerif)
-    font.setPointSize(10)
-    app.setFont(font)
-    settings = QSettings("Zonos", "VoiceCloner")
-    config = DEFAULT_CONFIG.copy()
-    for key in config:
-        value = settings.value(key)
-        if value:
-            config[key] = value
-    def save_config(config):
-        for key, value in config.items():
-            settings.setValue(key, value)
-    window = VoiceCloneGUI(config, save_config)
-    window.show()
-    window.raise_()
-    window.activateWindow()
+    font = QFont(); font.setPointSize(10); app.setFont(font)
+    w = VoiceCloner(); w.show()
     sys.exit(app.exec_())
 
 if __name__ == "__main__":
