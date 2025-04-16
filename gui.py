@@ -6,14 +6,11 @@ import datetime
 EXPECTED_VENV_DIR = Path.cwd() / ".venv"
 
 def check_environment():
-    # Check environment activated
     venv_path = os.getenv("VIRTUAL_ENV")
     if not venv_path or not venv_path.startswith(str(EXPECTED_VENV_DIR)):
         print("\n[Zonos Launcher] Error: Not in the dedicated virtual environment!")
         print(f"Expected VENV activated in: {EXPECTED_VENV_DIR}")
-        print("Please run:\n")
-        print("  source .venv/bin/activate")
-        print("  python gui.py\n")
+        print("Please run:\n  source .venv/bin/activate\n  python gui.py\n")
         sys.exit(1)
 
 check_environment()
@@ -32,14 +29,9 @@ for pkg in REQUIRED_PKGS:
         missing.append(pkg)
 
 if missing:
-    print("\n==== Missing required packages ====\n")
-    print(" ".join(missing))
-    print("\nPlease run setup again:\n")
-    print("  source .venv/bin/activate")
-    print("  ./setup_zonos.sh\n")
+    print("\n==== Missing required packages ====\n", " ".join(missing))
+    print("\nPlease run:\n  source .venv/bin/activate\n  ./setup_zonos.sh\n")
     sys.exit(1)
-
-# === Imports proceed safely ===
 
 try:
     import torch, torchaudio
@@ -50,7 +42,6 @@ except Exception as e:
     print("\nUnexpected import error:", e)
     sys.exit(1)
 
-# Optionally force CPU use only, safer on many systems
 def force_cpu():
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ.pop("DRI_PRIME", None)
@@ -101,7 +92,10 @@ class VoiceCloner(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Zonos Voice Cloner")
-        font = QFont(); font.setPointSize(9); self.setFont(font)
+
+        font = QFont()
+        font.setPointSize(9)
+        self.setFont(font)
 
         self.settings = QSettings("Zonos", "VoiceCloner")
         self.config = dict(DEFAULT_CONFIG)
@@ -110,10 +104,13 @@ class VoiceCloner(QMainWindow):
             if v: self.config[k] = v
 
         self.last_output = None
+        self.is_generating = False   # Busy flag
 
-        cw = QWidget(); self.setCentralWidget(cw)
+        cw = QWidget()
+        self.setCentralWidget(cw)
         lay = QVBoxLayout(cw)
 
+        # Folders row
         fr = QHBoxLayout()
         fr.addWidget(QLabel("Presets folder:"))
         self.presets_edit = QLineEdit(self.config['presets_dir']); fr.addWidget(self.presets_edit)
@@ -131,6 +128,7 @@ class VoiceCloner(QMainWindow):
         savebtn = QPushButton("Save folders"); savebtn.clicked.connect(self.save_paths)
         lay.addWidget(savebtn)
 
+        # Voices row
         hr = QHBoxLayout()
         hr.addWidget(QLabel("Voice Preset:"))
         self.combo = QComboBox(); hr.addWidget(self.combo)
@@ -139,23 +137,36 @@ class VoiceCloner(QMainWindow):
         self.playbtn.clicked.connect(self.play_voice)
         lay.addLayout(hr)
 
+        # custom voice area
         self.custom_container = QWidget()
         ch = QHBoxLayout(self.custom_container)
         ch.addWidget(QLabel("Custom file:"))
         self.cust_label = QLabel("None"); ch.addWidget(self.cust_label)
-        bc = QPushButton("Browse..."); ch.addWidget(bc)
-        bc.clicked.connect(self.pick_custom)
+        bc = QPushButton("Browse..."); bc.clicked.connect(self.pick_custom); ch.addWidget(bc)
         lay.addWidget(self.custom_container)
         self.custom_container.setVisible(False)
 
+        # Text and token count
         lay.addWidget(QLabel("Text:"))
         self.textbox = QTextEdit(); lay.addWidget(self.textbox)
+        self.token_label = QLabel("Estimated tokens: 0 / max 2588")
+        lay.addWidget(self.token_label)
 
+        self.textbox.textChanged.connect(self.update_token_estimate)
+        self.update_token_estimate()  # initial count
+
+        # Generate button
         self.genbtn = QPushButton("Generate voice"); lay.addWidget(self.genbtn)
         self.genbtn.clicked.connect(self.generate)
 
+        # Status and output
         self.status = QLabel("Ready"); lay.addWidget(self.status)
         self.outlabel = QLabel("No output yet."); lay.addWidget(self.outlabel)
+
+        # Play last output button
+        self.playoutbtn = QPushButton("Play last output"); lay.addWidget(self.playoutbtn)
+        self.playoutbtn.clicked.connect(self.play_last_output)
+        self.playoutbtn.setEnabled(False)
 
         self.refresh_presets()
         self.model = None
@@ -198,7 +209,6 @@ class VoiceCloner(QMainWindow):
             self.voice_path = None
             self.cust_label.setText("None")
             self.playbtn.setEnabled(False)
-            return
         else:
             self.custom_container.setVisible(False)
             f = self.presets.get(vname)
@@ -234,7 +244,17 @@ class VoiceCloner(QMainWindow):
             QMessageBox.critical(self, "Error loading model", tb)
             self.status.setText("Model load error")
 
+    def update_token_estimate(self):
+        text = self.textbox.toPlainText()
+        est = int(len(text) / 4)
+        est = min(est, 2588)
+        self.token_label.setText(f"Estimated tokens: {est} / max 2588")
+
     def generate(self):
+        if self.is_generating:
+            QMessageBox.information(self, "Please wait", "Generation is already running.")
+            return
+
         if not self.model:
             QMessageBox.warning(self, "No model", "Model not loaded yet")
             return
@@ -246,8 +266,18 @@ class VoiceCloner(QMainWindow):
             QMessageBox.warning(self, "No voice", "Please select a reference voice")
             return
 
+        # Optionally warn over limit
+        est = int(len(txt) / 4)
+        if est > 2588:
+            QMessageBox.warning(self, "Input too long",
+                                f"Input is about {est} tokens, more than model limit of 2588.")
+            return
+
+        self.is_generating = True
+        self.genbtn.setEnabled(False)
         self.status.setText("Generating...")
         QApplication.processEvents()
+
         wrk = Worker(self.model, self.voice_path, txt, self.out_edit.text())
         self.worker = wrk
         wrk.done.connect(self.gen_done)
@@ -260,15 +290,31 @@ class VoiceCloner(QMainWindow):
         self.outlabel.setText(f"Saved to:\n{path}")
         QMessageBox.information(self, "Done", f"Voice saved:\n{path}")
 
+        self.is_generating = False
+        self.genbtn.setEnabled(True)
+        self.playoutbtn.setEnabled(True)
+
     def gen_error(self, error_text):
         self.status.setText("Error")
         print(error_text)
         QMessageBox.critical(self, "Generation failed", error_text)
 
+        self.is_generating = False
+        self.genbtn.setEnabled(True)
+
+    def play_last_output(self):
+        if self.last_output and Path(self.last_output).exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self.last_output).resolve())))
+        else:
+            QMessageBox.warning(self, "No output", "No generated audio found.")
+
 def main():
     app = QApplication(sys.argv)
-    font = QFont(); font.setPointSize(10); app.setFont(font)
-    w = VoiceCloner(); w.show()
+    font = QFont()
+    font.setPointSize(10)
+    app.setFont(font)
+    w = VoiceCloner()
+    w.show()
     sys.exit(app.exec_())
 
 if __name__ == "__main__":
